@@ -1,0 +1,12 @@
+{
+  "name": "tensorflowjs-model-test",
+  "version": "1.0.0",
+  "description": "Test script for TensorFlow.js model conversion",
+  "main": "test_model.js",
+  "scripts": {
+    "test": "node test_model.js"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.15.0"
+  }
+}
