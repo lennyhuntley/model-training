@@ -7,7 +7,7 @@ export DISPLAY_NAME="know_now_training_job_$UUID"
 export MACHINE_TYPE="n1-standard-4"
 export REPLICA_COUNT=1
 export EXECUTOR_IMAGE_URI="us-docker.pkg.dev/vertex-ai/training/tf-gpu.2-16.py310:latest"
-export PYTHON_PACKAGE_URI=$GCS_BUCKET_URI/know-now-app-trainer.tar.gz
+export PYTHON_PACKAGE_URI=gs://know-now-app-trainer-lh/know-now-app-trainer.tar.gz
 export PYTHON_MODULE="trainer.task"
 export ACCELERATOR_TYPE="NVIDIA_TESLA_T4"
 export ACCELERATOR_COUNT=1
@@ -18,7 +18,7 @@ export GCP_REGION="us-central1" # Adjust region based on you approved quotas for
 # Ensure WANDB_KEY is set in your environment: export WANDB_KEY='your_key_here'
 export GCS_BUCKET_NAME="know-now-app-training-data-lh"
 export GCS_DATA_DIR="gs://$GCS_BUCKET_NAME/data/nabirds"
-export CMDARGS="--gcs_data_dir=$GCS_DATA_DIR,--epochs_warmup=2,--epochs_finetune=2,--batch_size=32,--lr_warmup=1e-3,--lr_fine=3e-4,--wandb_key=$WANDB_KEY"
+export CMDARGS="--gcs_data_dir=$GCS_DATA_DIR,--percent_to_use=0.25,--epochs_warmup=2,--epochs_finetune=4,--batch_size=32,--lr_warmup=1e-3,--lr_fine=3e-4,--wandb_key=$WANDB_KEY"
 # Run training with GPU
 gcloud ai custom-jobs create \
   --project=$GCP_PROJECT \

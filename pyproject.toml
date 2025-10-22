@@ -8,4 +8,5 @@ dependencies = [
     "google-cloud-aiplatform>=1.120.0",
     "google-cloud-storage",
     "requests",
+    "python-json-logger==2.0.7",
 ]

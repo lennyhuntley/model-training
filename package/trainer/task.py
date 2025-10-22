@@ -24,6 +24,7 @@ from keras.metrics import TopKCategoricalAccuracy
 # --- Library Imports ---
 import deeplake as dl
 import wandb
+from wandb.keras import WandbMetricsLogger
 from google.cloud import storage
 
 # --- Argument Parsing & Configuration ---
@@ -38,6 +39,9 @@ def get_args():
 
     # --- Dataset --- 
     
+    # --- Dataset ---
+    parser.add_argument("--percent_to_use", type=float, default=1.0, help="Percentage of the training dataset to use (0.0 to 1.0).")
+
     # --- Model --- 
     parser.add_argument("--model_name", type=str, default="mobilenetv2_nabirds_finetuned", help="Base name for the trained model.")
     parser.add_argument("--img_size", type=int, default=224, help="Input image size (height and width).")
@@ -111,7 +115,7 @@ def _parse_tfrecord_fn(example):
     label = tf.cast(example['label'], tf.int32)
     return image, label
 
-def create_dataset_from_tfrecords(gcs_path, img_size, num_classes, training, batch_size):
+def create_dataset_from_tfrecords(gcs_path, img_size, num_classes, training, batch_size, num_samples, percent_to_use=1.0):
     """Creates a tf.data.Dataset from TFRecords in GCS."""
     dataset = tf.data.Dataset.list_files(gcs_path, shuffle=training)
 
@@ -131,6 +135,11 @@ def create_dataset_from_tfrecords(gcs_path, img_size, num_classes, training, bat
 
     dataset = dataset.map(_prep, num_parallel_calls=tf.data.AUTOTUNE)
 
+        # For training, optionally take a subset of the data
+    if training and percent_to_use < 1.0:
+        num_subset = int(num_samples * percent_to_use)
+        dataset = dataset.take(num_subset)
+
     if training:
         dataset = dataset.shuffle(10000) # Shuffle records
 
@@ -147,14 +156,18 @@ train_ds = create_dataset_from_tfrecords(
     args.img_size,
     NUM_CLASSES,
     training=True,
-    batch_size=args.batch_size
+    batch_size=args.batch_size,
+    num_samples=NUM_TRAIN_SAMPLES,
+    percent_to_use=args.percent_to_use
 )
+# Always use the full validation set
 val_ds = create_dataset_from_tfrecords(
     val_path,
     args.img_size,
     NUM_CLASSES,
     training=False,
-    batch_size=args.batch_size
+    batch_size=args.batch_size,
+    num_samples=NUM_VAL_SAMPLES
 )
 
 print("Data pipelines ready.")
@@ -182,6 +195,9 @@ def build_model(num_classes, img_size):
     # Augmentation
     x = make_augmenter(img_size)(x)
 
+    # Pre-processing for MobileNetV2
+    x = keras.applications.mobilenet_v2.preprocess_input(x)
+
     
     # Backbone
     backbone = keras.applications.MobileNetV2(
@@ -191,8 +207,8 @@ def build_model(num_classes, img_size):
     )
     backbone.trainable = False  # Start with a frozen backbone
 
-    # Classification Head
-    x = backbone(x, training=False)
+    # Pass the backbone's output to the classification head
+    x = backbone(x) # Let the fine-tuning fit call control the training mode
     x = layers.GlobalAveragePooling2D(name="gap")(x)
     x = layers.Dropout(0.2, name="dropout")(x)
     
@@ -228,22 +244,6 @@ def unfreeze_top(model: keras.Model, ratio: float, freeze_bn: bool = True):
 
 print("Model building functions defined.")
 
-class LogLearningRate(keras.callbacks.Callback):
-    """Logs the current learning rate to W&B."""
-    def on_epoch_end(self, epoch, logs=None):
-        try:
-            lr = self.model.optimizer.learning_rate
-            if isinstance(lr, keras.optimizers.schedules.LearningRateSchedule):
-                # Get the value from the schedule at the current step
-                step = self.model.optimizer.iterations
-                lr_value = lr(step)
-                wandb.log({'learning_rate': lr_value.numpy()}, commit=False)
-            else:
-                # For a static learning rate
-                wandb.log({'learning_rate': keras.backend.get_value(lr)}, commit=False)
-        except Exception as e:
-            print(f"W&B: Could not log learning rate: {e}")
-
 # --- Training --- 
 print("\n--- Training Initializing ---")
 
@@ -270,10 +270,11 @@ with strategy.scope():
     model.compile(
         optimizer=Adam(learning_rate=args.lr_warmup),
         loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
-        metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5_accuracy")]
+        metrics=["accuracy"]
     )
 
-    steps_per_epoch = NUM_TRAIN_SAMPLES // args.batch_size
+    num_train_subset = int(NUM_TRAIN_SAMPLES * args.percent_to_use)
+    steps_per_epoch = num_train_subset // args.batch_size
     validation_steps = int(math.ceil(NUM_VAL_SAMPLES / args.batch_size))
 
     model.fit(
@@ -282,28 +283,22 @@ with strategy.scope():
         epochs=args.epochs_warmup,
         steps_per_epoch=steps_per_epoch,
         validation_steps=validation_steps,
-        callbacks=[wandb.keras.WandbMetricsLogger(log_freq="epoch")],
+        callbacks=[WandbMetricsLogger()], 
         verbose=2
     )
 
     # --- 2. Fine-tuning Phase ---
     print("\n--- Phase 2: Fine-tuning ---")
     unfreeze_top(model, ratio=args.freeze_ratio, freeze_bn=True)
+    
+    # Set a new, lower learning rate for fine-tuning
+    new_lr = args.lr_fine
+    model.optimizer.learning_rate.assign(new_lr)
+    print(f"Optimizer learning rate set to {model.optimizer.learning_rate.numpy()}")
 
-    total_ft_steps = steps_per_epoch * args.epochs_finetune
-    lr_schedule = CosineDecay(initial_learning_rate=args.lr_fine, decay_steps=total_ft_steps, alpha=0.1)
-
-    with strategy.scope():
-        model.compile(
-            optimizer=AdamW(learning_rate=lr_schedule, weight_decay=args.weight_decay, clipnorm=1.0),
-            loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
-            metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5_accuracy")]
-        )
-
-    # Callbacks for fine-tuning
-    # Note: W&B Model Checkpointing saves the model to W&B servers
-    callbacks = [
-        wandb.keras.WandbMetricsLogger(log_freq="epoch"),
+    # Callbacks for fine-tuning, including W&B logger
+    finetune_callbacks = [
+        WandbMetricsLogger(),
         keras.callbacks.ModelCheckpoint(
             filepath=f"gs://{args.gcs_bucket}/checkpoints/{wdb_run_name}/best_model.keras",
             monitor='val_accuracy',
@@ -312,45 +307,49 @@ with strategy.scope():
         ),
         keras.callbacks.EarlyStopping(
             monitor="val_accuracy", mode="max", patience=3, restore_best_weights=True, verbose=1
-        ),
-        LogLearningRate()
+        )
     ]
 
-    history_ft = model.fit(
+    # Second training phase: Fine-tuning
+    model.fit(
         train_ds.repeat(),
         validation_data=val_ds.repeat(),
         epochs=args.epochs_finetune,
         steps_per_epoch=steps_per_epoch,
         validation_steps=validation_steps,
-        callbacks=callbacks,
+        callbacks=finetune_callbacks,
         verbose=2
     )
 
-# --- Evaluation and Saving ---
-print("\n--- Final Evaluation ---")
-eval_out = model.evaluate(val_ds, steps=validation_steps, verbose=1)
-final_metrics = dict(zip(model.metrics_names, eval_out))
-print("Final eval metrics:", final_metrics)
-wdb.log({"final_eval_" + k: v for k, v in final_metrics.items()})
+    # --- Evaluation and Saving (inside strategy scope) ---
+    print("\n--- Final Evaluation ---")
+    # Re-compile the model to ensure metrics are correctly initialized for evaluation
+    model.compile(
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
+        metrics=["accuracy"]
+    )
+    eval_out = model.evaluate(val_ds, steps=validation_steps, verbose=1, return_dict=True)
+    print("Final eval metrics:", eval_out)
+    wdb.log({"final_eval_" + k: v for k, v in eval_out.items()})
 
-# Save the final model to a .keras file
-model_filename = f"{args.model_name}.keras"
-model.save(model_filename)
-print(f"Model saved locally to {model_filename}")
+    # Save the final model to a .keras file
+    model_filename = f"{args.model_name}.keras"
+    model.save(model_filename)
+    print(f"Model saved locally to {model_filename}")
 
-# Upload to GCS
-print(f"\n--- Uploading to GCS ---")
-try:
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(args.gcs_bucket)
-    gcs_model_path = f"models/{wdb_run_name}/{model_filename}"
-    blob = bucket.blob(gcs_model_path)
-    blob.upload_from_filename(model_filename)
-    print(f"✅ Model successfully uploaded to gs://{args.gcs_bucket}/{gcs_model_path}")
-except Exception as e:
-    print(f"ERROR: Failed to upload model to GCS: {e}")
+    # Upload to GCS
+    print(f"\n--- Uploading to GCS ---")
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(args.gcs_bucket)
+        gcs_model_path = f"models/{wdb_run_name}/{model_filename}"
+        blob = bucket.blob(gcs_model_path)
+        blob.upload_from_filename(model_filename)
+        print(f"✅ Model successfully uploaded to gs://{args.gcs_bucket}/{gcs_model_path}")
+    except Exception as e:
+        print(f"ERROR: Failed to upload model to GCS: {e}")
 
-# Finish W&B run
+# Finish W&B run (outside scope)
 wdb.finish()
 
 print("\n--- Training Job Complete ---")
