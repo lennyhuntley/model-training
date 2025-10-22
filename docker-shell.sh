@@ -5,13 +5,16 @@ set -e
 export IMAGE_NAME="model-training-cli"
 export BASE_DIR=$(pwd)
 export SECRETS_DIR=$(pwd)/../secrets/
-export GCS_BUCKET_URI="gs://cheese-app-trainer"
-export GCP_PROJECT="ac215-project"
+export GCS_BUCKET_URI="gs://know-now-app-trainer-lh"
+export GCP_PROJECT="ac215-475412"
 
 
 # Build the image based on the Dockerfile
 #docker build -t $IMAGE_NAME -f Dockerfile .
-docker build -t $IMAGE_NAME --platform=linux/amd64 -f Dockerfile .
+#docker build -t $IMAGE_NAME --platform=linux/amd64 -f Dockerfile .
+
+#Mac OSX
+docker build -t $IMAGE_NAME --platform=linux/arm64/v8 -f Dockerfile .
 
 # Run Container
 docker run --rm --name $IMAGE_NAME -ti \

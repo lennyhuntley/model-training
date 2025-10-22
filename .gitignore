@@ -1,4 +1,10 @@
 # misc
 .DS_Store
 /docker-volumes
-trainer.tar.gz
+trainer.tar.gzdist/
+*.tar.gz
+google-cloud-sdk/
+dist/
+*.tar.gz
+__pycache__/
+*.pyc

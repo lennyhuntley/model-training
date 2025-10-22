@@ -1,341 +1,356 @@
-import argparse
+# -*- coding: utf-8 -*-
+"""Vertex AI fine-tuning script for NABirds using MobileNetV2."""
+
 import os
-import requests
-import zipfile
-import tarfile
+import argparse
 import time
+import math
+import sys
+import numpy as np
+import shutil
 
-# Tensorflow
+# Set Keras backend before importing
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
+# --- Main Imports ---
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.utils import to_categorical
-from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.utils.layer_utils import count_params
+import keras
+from keras import layers, models
+from keras import mixed_precision
+from keras.optimizers import Adam, AdamW
+from keras.optimizers.schedules import CosineDecay
+from keras.metrics import TopKCategoricalAccuracy
 
-# sklearn
-from sklearn.model_selection import train_test_split
-
-
-# W&B
+# --- Library Imports ---
+import deeplake as dl
 import wandb
-from wandb.keras import WandbCallback, WandbMetricsLogger
+from google.cloud import storage
 
+# --- Argument Parsing & Configuration ---
 
-# Setup the arguments for the trainer task
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--model-dir", dest="model_dir", default="test", type=str, help="Model dir."
-)
-parser.add_argument("--lr", dest="lr", default=0.001, type=float, help="Learning rate.")
-parser.add_argument(
-    "--model_name",
-    dest="model_name",
-    default="mobilenetv2",
-    type=str,
-    help="Model name",
-)
-parser.add_argument(
-    "--train_base",
-    dest="train_base",
-    default=False,
-    action="store_true",
-    help="Train base or not",
-)
-parser.add_argument(
-    "--epochs", dest="epochs", default=10, type=int, help="Number of epochs."
-)
-parser.add_argument(
-    "--batch_size", dest="batch_size", default=16, type=int, help="Size of a batch."
-)
-parser.add_argument(
-    "--wandb_key", dest="wandb_key", default="16", type=str, help="WandB API Key"
-)
-args = parser.parse_args()
+def get_args():
+    parser = argparse.ArgumentParser(description="Vertex AI Fine-tuning for NABirds")
 
-# TF Version
-print("tensorflow version", tf.__version__)
-print("Eager Execution Enabled:", tf.executing_eagerly())
+    # --- W&B and GCS --- 
+    parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key.")
+    parser.add_argument("--gcs_data_dir", type=str, required=True, help="GCS directory containing the TFRecord data.")
+    parser.add_argument("--gcs_bucket", type=str, default="know-now-app-training-data-lh", help="GCS bucket for saving the final model.")
+
+    # --- Dataset --- 
+    
+    # --- Model --- 
+    parser.add_argument("--model_name", type=str, default="mobilenetv2_nabirds_finetuned", help="Base name for the trained model.")
+    parser.add_argument("--img_size", type=int, default=224, help="Input image size (height and width).")
+
+    # --- Training Phases ---
+    parser.add_argument("--epochs_warmup", type=int, default=2, help="Epochs for the warmup phase (frozen backbone).")
+    parser.add_argument("--epochs_finetune", type=int, default=2, help="Epochs for the fine-tuning phase.")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training and validation.")
+
+    # --- Hyperparameters ---
+    parser.add_argument("--lr_warmup", type=float, default=1e-3, help="Learning rate for the warmup phase.")
+    parser.add_argument("--lr_fine", type=float, default=3e-4, help="Base learning rate for the fine-tuning phase.")
+    parser.add_argument("--weight_decay", type=float, default=2e-5, help="Weight decay for AdamW optimizer in fine-tuning.")
+    parser.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing for the loss function.")
+    parser.add_argument("--freeze_ratio", type=float, default=0.75, help="Ratio of backbone layers to keep frozen during fine-tuning (e.g., 0.75 unfreezes top 25%%).")
+
+    return parser.parse_args()
+
+# --- Initial Setup ---
+args = get_args()
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# --- GPU & Mixed Precision Setup ---
+print("--- System Setup ---")
+print("TF:", tf.__version__)
+print("Keras:", keras.__version__)
+print("Keras backend:", keras.backend.backend())
+
+if tf.config.list_physical_devices('GPU'):
+    print("Physical GPUs:", tf.config.list_physical_devices('GPU'))
+    mixed_precision.set_global_policy("mixed_float16")
+    print("Mixed precision policy:", mixed_precision.global_policy())
+    # Allow gradual memory growth
+    for g in tf.config.list_physical_devices('GPU'):
+        try:
+            tf.config.experimental.set_memory_growth(g, True)
+        except Exception as e:
+            print(f"Could not set memory growth for {g}: {e}")
+else:
+    print("No GPU detected. Running on CPU.")
 # Get the number of replicas
 strategy = tf.distribute.MirroredStrategy()
 print("Number of replicas:", strategy.num_replicas_in_sync)
+
 
 devices = tf.config.experimental.get_visible_devices()
 print("Devices:", devices)
 print(tf.config.experimental.list_logical_devices("GPU"))
 
-print("GPU Available: ", tf.config.list_physical_devices("GPU"))
-print("All Physical Devices", tf.config.list_physical_devices())
 
 
-# Utils functions
-def download_file(packet_url, base_path="", extract=False, headers=None):
-    if base_path != "":
-        if not os.path.exists(base_path):
-            os.mkdir(base_path)
-    packet_file = os.path.basename(packet_url)
-    with requests.get(packet_url, stream=True, headers=headers) as r:
-        r.raise_for_status()
-        with open(os.path.join(base_path, packet_file), "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+# --- Data Pipeline ---
+print("\n--- Data Pipeline Setup ---")
 
-    if extract:
-        if packet_file.endswith(".zip"):
-            with zipfile.ZipFile(os.path.join(base_path, packet_file)) as zfile:
-                zfile.extractall(base_path)
-        else:
-            packet_name = packet_file.split(".")[0]
-            with tarfile.open(os.path.join(base_path, packet_file)) as tfile:
-                tfile.extractall(base_path)
+# Dataset constants
+NUM_CLASSES = 555
+NUM_TRAIN_SAMPLES = 23928
+NUM_VAL_SAMPLES = 24633
 
+# --- TFRecord Parsing Functions ---
+def _parse_tfrecord_fn(example):
+    """Parses a single TFRecord example."""
+    feature_description = {
+        'image': tf.io.FixedLenFeature([], tf.string),
+        'label': tf.io.FixedLenFeature([], tf.int64),
+    }
+    example = tf.io.parse_single_example(example, feature_description)
+    image = tf.io.parse_tensor(example['image'], out_type=tf.uint8)
+    image.set_shape([None, None, 3]) # Reshape from raw bytes
+    label = tf.cast(example['label'], tf.int32)
+    return image, label
 
-# Download Data
-print("Downloading data...")
-start_time = time.time()
-download_file(
-    "https://github.com/dlops-io/datasets/releases/download/v4.0/cheese_4_labels.zip",
-    base_path="datasets",
-    extract=True,
+def create_dataset_from_tfrecords(gcs_path, img_size, num_classes, training, batch_size):
+    """Creates a tf.data.Dataset from TFRecords in GCS."""
+    dataset = tf.data.Dataset.list_files(gcs_path, shuffle=training)
+
+    dataset = dataset.interleave(
+        lambda x: tf.data.TFRecordDataset(x, compression_type='GZIP'),
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=not training
+    )
+
+    dataset = dataset.map(_parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
+    def _prep(img, lbl):
+        img = tf.image.resize(img, [img_size, img_size], antialias=True)
+        lbl = tf.one_hot(lbl, num_classes, dtype=tf.float32)
+        return img, lbl
+
+    dataset = dataset.map(_prep, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if training:
+        dataset = dataset.shuffle(10000) # Shuffle records
+
+    dataset = dataset.batch(batch_size, drop_remainder=training)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+# Create datasets from TFRecords
+train_path = os.path.join(args.gcs_data_dir, "nabirds_train.tfrecord.gz")
+val_path = os.path.join(args.gcs_data_dir, "nabirds_val.tfrecord.gz")
+
+train_ds = create_dataset_from_tfrecords(
+    train_path,
+    args.img_size,
+    NUM_CLASSES,
+    training=True,
+    batch_size=args.batch_size
 )
-execution_time = (time.time() - start_time) / 60.0
-print("Download execution time (mins)", execution_time)
-
-# Load Data
-base_path = os.path.join("datasets", "cheese")
-label_names = os.listdir(base_path)
-print("Labels:", label_names)
-
-# Number of unique labels
-num_classes = len(label_names)
-# Create label index for easy lookup
-label2index = dict((name, index) for index, name in enumerate(label_names))
-index2label = dict((index, name) for index, name in enumerate(label_names))
-
-# Generate a list of labels and path to images
-data_list = []
-for label in label_names:
-    # Images
-    image_files = os.listdir(os.path.join(base_path, label))
-    data_list.extend([(label, os.path.join(base_path, label, f)) for f in image_files])
-
-print("Full size of the dataset:", len(data_list))
-print("data_list:", data_list[:5])
-
-# Load X & Y
-# Build data x, y
-data_x = [itm[1] for itm in data_list]
-data_y = [itm[0] for itm in data_list]
-print("data_x:", len(data_x))
-print("data_y:", len(data_y))
-print("data_x:", data_x[:5])
-print("data_y:", data_y[:5])
-
-# Split Data
-test_percent = 0.10
-validation_percent = 0.2
-
-# Split data into train / test
-train_validate_x, test_x, train_validate_y, test_y = train_test_split(
-    data_x, data_y, test_size=test_percent
+val_ds = create_dataset_from_tfrecords(
+    val_path,
+    args.img_size,
+    NUM_CLASSES,
+    training=False,
+    batch_size=args.batch_size
 )
 
-# Split data into train / validate
-train_x, validate_x, train_y, validate_y = train_test_split(
-    train_validate_x, train_validate_y, test_size=test_percent
-)
+print("Data pipelines ready.")
 
-print("train_x count:", len(train_x))
-print("validate_x count:", len(validate_x))
-print("test_x count:", len(test_x))
+# --- Model Building ---
+print("\n--- Model Definition ---")
 
-# Login into wandb
-wandb.login(key=args.wandb_key)
+def make_augmenter(img_size):
+    """Creates a Keras Sequential model for lightweight augmentation."""
+    # For fine-grained tasks, heavy augmentation can sometimes hurt.
+    return keras.Sequential([
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.05),
+        layers.RandomZoom(height_factor=0.1, width_factor=0.1),
+        layers.RandomContrast(0.1),
+    ], name="augmentation")
 
+def build_model(num_classes, img_size):
+    """Builds the MobileNetV2 model for fine-tuning."""
+    inputs = layers.Input(shape=(img_size, img_size, 3), dtype="uint8")
+    
+    # Cast to float32 for augmentation and preprocessing within a Keras layer
+    x = layers.Lambda(lambda t: tf.cast(t, "float32"))(inputs)
 
-# Create TF Datasets
-def get_dataset(image_width=224, image_height=224, num_channels=3, batch_size=32):
-    # Load Image
-    def load_image(path, label):
-        image = tf.io.read_file(path)
-        image = tf.image.decode_jpeg(image, channels=num_channels)
-        image = tf.image.resize(image, [image_height, image_width])
-        return image, label
+    # Augmentation
+    x = make_augmenter(img_size)(x)
 
-    # Normalize pixels
-    def normalize(image, label):
-        image = image / 255
-        return image, label
-
-    train_shuffle_buffer_size = len(train_x)
-    validation_shuffle_buffer_size = len(validate_x)
-
-    # Convert all y labels to numbers
-    train_processed_y = [label2index[label] for label in train_y]
-    validate_processed_y = [label2index[label] for label in validate_y]
-    test_processed_y = [label2index[label] for label in test_y]
-
-    # Converts to y to binary class matrix (One-hot-encoded)
-    train_processed_y = to_categorical(train_processed_y, num_classes=num_classes)
-    validate_processed_y = to_categorical(validate_processed_y, num_classes=num_classes)
-    test_processed_y = to_categorical(test_processed_y, num_classes=num_classes)
-
-    # Create TF Dataset
-    train_data = tf.data.Dataset.from_tensor_slices((train_x, train_processed_y))
-    validation_data = tf.data.Dataset.from_tensor_slices(
-        (validate_x, validate_processed_y)
+    
+    # Backbone
+    backbone = keras.applications.MobileNetV2(
+        include_top=False,
+        input_shape=(img_size, img_size, 3),
+        weights="imagenet"
     )
-    test_data = tf.data.Dataset.from_tensor_slices((test_x, test_processed_y))
+    backbone.trainable = False  # Start with a frozen backbone
 
-    #############
-    # Train data
-    #############
-    # Apply all data processing logic
-    train_data = train_data.shuffle(buffer_size=train_shuffle_buffer_size)
-    train_data = train_data.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-    train_data = train_data.map(normalize, num_parallel_calls=tf.data.AUTOTUNE)
-    train_data = train_data.batch(batch_size)
-    train_data = train_data.prefetch(tf.data.AUTOTUNE)
+    # Classification Head
+    x = backbone(x, training=False)
+    x = layers.GlobalAveragePooling2D(name="gap")(x)
+    x = layers.Dropout(0.2, name="dropout")(x)
+    
+    # Use float32 for the final layer for numerical stability
+    logits = layers.Dense(num_classes, dtype="float32", name="logits")(x)
+    probs = layers.Activation("softmax", dtype="float32", name="probs")(logits)
 
-    ##################
-    # Validation data
-    ##################
-    # Apply all data processing logic
-    validation_data = validation_data.shuffle(
-        buffer_size=validation_shuffle_buffer_size
-    )
-    validation_data = validation_data.map(
-        load_image, num_parallel_calls=tf.data.AUTOTUNE
-    )
-    validation_data = validation_data.map(
-        normalize, num_parallel_calls=tf.data.AUTOTUNE
-    )
-    validation_data = validation_data.batch(batch_size)
-    validation_data = validation_data.prefetch(tf.data.AUTOTUNE)
-
-    ############
-    # Test data
-    ############
-    # Apply all data processing logic
-    test_data = test_data.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-    test_data = test_data.map(normalize, num_parallel_calls=tf.data.AUTOTUNE)
-    test_data = test_data.batch(batch_size)
-    test_data = test_data.prefetch(tf.data.AUTOTUNE)
-
-    return (train_data, validation_data, test_data)
-
-
-def build_mobilenet_model(
-    image_height, image_width, num_channels, num_classes, model_name, train_base=False
-):
-    # Model input
-    input_shape = [image_height, image_width, num_channels]  # height, width, channels
-
-    # Load a pretrained model from keras.applications
-    tranfer_model_base = keras.applications.MobileNetV2(
-        input_shape=input_shape, weights="imagenet", include_top=False
-    )
-
-    # Freeze the mobileNet model layers
-    tranfer_model_base.trainable = train_base
-
-    # Regularize using L1
-    kernel_weight = 0.02
-    bias_weight = 0.02
-
-    model = Sequential(
-        [
-            tranfer_model_base,
-            keras.layers.GlobalAveragePooling2D(),
-            keras.layers.Dense(
-                units=128,
-                activation="relu",
-                kernel_regularizer=keras.regularizers.l1(kernel_weight),
-                bias_regularizer=keras.regularizers.l1(bias_weight),
-            ),
-            keras.layers.Dense(
-                units=num_classes,
-                activation="softmax",
-                kernel_regularizer=keras.regularizers.l1(kernel_weight),
-                bias_regularizer=keras.regularizers.l1(bias_weight),
-            ),
-        ],
-        name=model_name + "_train_base_" + str(train_base),
-    )
-
+    model = keras.Model(inputs, probs, name=args.model_name)
+    model._backbone = backbone  # Attach for easy access later
     return model
 
+def unfreeze_top(model: keras.Model, ratio: float, freeze_bn: bool = True):
+    """Unfreezes the top `ratio` of layers in the model's backbone."""
+    backbone = getattr(model, "_backbone", None)
+    if backbone is None:
+        print("WARNING: Model has no '_backbone' attribute to unfreeze.")
+        return
 
-print("Train model")
-############################
-# Training Params
-############################
-model_name = args.model_name
-learning_rate = 0.001
-image_width = 224
-image_height = 224
-num_channels = 3
-batch_size = args.batch_size
-epochs = args.epochs
-train_base = args.train_base
+    n_layers = len(backbone.layers)
+    n_to_unfreeze = int(n_layers * (1 - ratio))
+    
+    print(f"Unfreezing top {n_to_unfreeze} / {n_layers} layers of the backbone.")
 
-# Free up memory
-K.clear_session()
+    for i, layer in enumerate(reversed(backbone.layers)):
+        if i < n_to_unfreeze:
+            layer.trainable = True
+        else:
+            layer.trainable = False
+        
+        # Optionally keep BatchNormalization layers frozen
+        if freeze_bn and isinstance(layer, layers.BatchNormalization):
+            layer.trainable = False
 
-# Data
-train_data, validation_data, test_data = get_dataset(
-    image_width=image_width,
-    image_height=image_height,
-    num_channels=num_channels,
-    batch_size=batch_size,
-)
+print("Model building functions defined.")
 
+class LogLearningRate(keras.callbacks.Callback):
+    """Logs the current learning rate to W&B."""
+    def on_epoch_end(self, epoch, logs=None):
+        try:
+            lr = self.model.optimizer.learning_rate
+            if isinstance(lr, keras.optimizers.schedules.LearningRateSchedule):
+                # Get the value from the schedule at the current step
+                step = self.model.optimizer.iterations
+                lr_value = lr(step)
+                wandb.log({'learning_rate': lr_value.numpy()}, commit=False)
+            else:
+                # For a static learning rate
+                wandb.log({'learning_rate': keras.backend.get_value(lr)}, commit=False)
+        except Exception as e:
+            print(f"W&B: Could not log learning rate: {e}")
 
-# Model
-model = build_mobilenet_model(
-    image_height,
-    image_width,
-    num_channels,
-    num_classes,
-    model_name,
-    train_base=train_base,
-)
-# Optimizer
-optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
-# Loss
-loss = keras.losses.categorical_crossentropy
-# Print the model architecture
-print(model.summary())
-# Compile
-model.compile(loss=loss, optimizer=optimizer, metrics=["accuracy"])
+# --- Training --- 
+print("\n--- Training Initializing ---")
 
-# Initialize a W&B run
-wandb.init(
-    project="cheese-training-vertex-ai",
-    config={
-        "learning_rate": learning_rate,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "model_name": model.name,
-    },
-    name=model.name,
-)
+# W&B Login
+wdb_key = os.environ.get("WANDB_API_KEY") or args.wandb_key
+if not wdb_key:
+    raise ValueError("W&B API key not found. Please set --wandb_key or WANDB_API_KEY env var.")
+wdb_project = "nabirds-finetuning-vertex"
+wdb_run_name = f"{args.model_name}-{int(time.time())}"
+wdb_config = vars(args)
 
-# Train model
-start_time = time.time()
-training_results = model.fit(
-    train_data,
-    validation_data=validation_data,
-    epochs=epochs,
-    verbose=1,
-)
-execution_time = (time.time() - start_time) / 60.0
-print("Training execution time (mins)", execution_time)
+wdb_config["num_classes"] = NUM_CLASSES
 
-# Update W&B
-wandb.config.update({"execution_time": execution_time})
-# Close the W&B run
-wandb.run.finish()
+wandb.login(key=wdb_key)
+wdb = wandb.init(project=wdb_project, name=wdb_run_name, config=wdb_config)
 
+# Build the model inside the strategy scope
+with strategy.scope():
+    model = build_model(NUM_CLASSES, args.img_size)
+    print(model.summary())
 
-print("Training Job Complete")
+    # --- 1. Warmup Phase ---
+    print("\n--- Phase 1: Warmup ---")
+    model.compile(
+        optimizer=Adam(learning_rate=args.lr_warmup),
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
+        metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5_accuracy")]
+    )
+
+    steps_per_epoch = NUM_TRAIN_SAMPLES // args.batch_size
+    validation_steps = int(math.ceil(NUM_VAL_SAMPLES / args.batch_size))
+
+    model.fit(
+        train_ds.repeat(),
+        validation_data=val_ds.repeat(),
+        epochs=args.epochs_warmup,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+        callbacks=[wandb.keras.WandbMetricsLogger(log_freq="epoch")],
+        verbose=2
+    )
+
+    # --- 2. Fine-tuning Phase ---
+    print("\n--- Phase 2: Fine-tuning ---")
+    unfreeze_top(model, ratio=args.freeze_ratio, freeze_bn=True)
+
+    total_ft_steps = steps_per_epoch * args.epochs_finetune
+    lr_schedule = CosineDecay(initial_learning_rate=args.lr_fine, decay_steps=total_ft_steps, alpha=0.1)
+
+    with strategy.scope():
+        model.compile(
+            optimizer=AdamW(learning_rate=lr_schedule, weight_decay=args.weight_decay, clipnorm=1.0),
+            loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
+            metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5_accuracy")]
+        )
+
+    # Callbacks for fine-tuning
+    # Note: W&B Model Checkpointing saves the model to W&B servers
+    callbacks = [
+        wandb.keras.WandbMetricsLogger(log_freq="epoch"),
+        keras.callbacks.ModelCheckpoint(
+            filepath=f"gs://{args.gcs_bucket}/checkpoints/{wdb_run_name}/best_model.keras",
+            monitor='val_accuracy',
+            mode='max',
+            save_best_only=True
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_accuracy", mode="max", patience=3, restore_best_weights=True, verbose=1
+        ),
+        LogLearningRate()
+    ]
+
+    history_ft = model.fit(
+        train_ds.repeat(),
+        validation_data=val_ds.repeat(),
+        epochs=args.epochs_finetune,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+        callbacks=callbacks,
+        verbose=2
+    )
+
+# --- Evaluation and Saving ---
+print("\n--- Final Evaluation ---")
+eval_out = model.evaluate(val_ds, steps=validation_steps, verbose=1)
+final_metrics = dict(zip(model.metrics_names, eval_out))
+print("Final eval metrics:", final_metrics)
+wdb.log({"final_eval_" + k: v for k, v in final_metrics.items()})
+
+# Save the final model to a .keras file
+model_filename = f"{args.model_name}.keras"
+model.save(model_filename)
+print(f"Model saved locally to {model_filename}")
+
+# Upload to GCS
+print(f"\n--- Uploading to GCS ---")
+try:
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(args.gcs_bucket)
+    gcs_model_path = f"models/{wdb_run_name}/{model_filename}"
+    blob = bucket.blob(gcs_model_path)
+    blob.upload_from_filename(model_filename)
+    print(f"✅ Model successfully uploaded to gs://{args.gcs_bucket}/{gcs_model_path}")
+except Exception as e:
+    print(f"ERROR: Failed to upload model to GCS: {e}")
+
+# Finish W&B run
+wdb.finish()
+
+print("\n--- Training Job Complete ---")

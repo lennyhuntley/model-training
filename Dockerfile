@@ -1,5 +1,5 @@
 # Use the official Python image as the base with Python 3.13
-FROM python:3.13-slim-bullseye
+FROM python:3.10-slim-bullseye
 
 # Prevent apt from showing prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -53,7 +53,7 @@ WORKDIR /app
 COPY --chown=app:app pyproject.toml uv.lock* ./
 
 # Install dependencies in a separate layer for better caching
-RUN uv sync --frozen
+RUN uv sync
 
 # Copy the rest of the source code
 COPY --chown=app:app . ./

@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: know-now-app-trainer-lh
+Version: 0.0.1
+Summary: Know Now App Trainer Application
+Requires-Dist: wandb==0.15.11
+Requires-Dist: python-json-logger==2.0.7
