@@ -63,12 +63,19 @@ Your folder structure should look like this:
 - This will create a service account
 - On the right "Actions" column click the vertical ... and select "Manage keys". A prompt for Create private key for "model-trainer" will appear select "JSON" and click create. This will download a Private key json file to your computer. Copy this json file into the **secrets** folder. Rename the json file to `model-trainer.json`
 
-### Create GCS Bucket
+### Create GCS Buckets
 
-We need a bucket to store the packaged python files that we will use for training.
+Several Google Cloud Storage buckets are required for this workflow. Replace the example names if you use a different project prefix, and ensure each bucket exists before running the scripts.
+
+| Purpose | Bucket | Contents | Relevant Script/Path |
+|---|---|---|---|
+| Package trainer artifacts | `gs://know-now-app-trainer-lh` | `trainer.tar.gz` bundles built by `package-trainer.sh` | `package-trainer.sh` |
+| Training dataset | `gs://kaggle_nabirds_data/nabirds_preprocessed` | Preprocessed NaBirds training data uploaded via `upload_data.sh` | `upload_data.sh` |
+| Saved Keras models | `gs://kaggle_nabirds_data/models/...` | Fine-tuned `.keras` exports produced by Vertex AI jobs | Vertex AI job outputs |
+| TensorFlow.js exports | `gs://kaggle_nabirds_data/mobile/...` | `model.json`, `group*-shard*.bin`, and `labels.json` produced by `convert_model_to_tfjs.sh` | `convert_model_to_tfjs.sh` |
 
 - Go to `https://console.cloud.google.com/storage/browser`
-- Create a bucket `cheese-app-trainer` [REPLACE WITH YOUR BUCKET NAME]
+- Create each bucket (or adjust the scripts/env vars to match your naming scheme) before proceeding
 
 ### Get WandB Account API Key
 
@@ -159,8 +166,21 @@ $IMAGE_NAME
 
 ### View Training Metrics
 - Go to [WandB](https://wandb.ai)
-- Select the project `cheese-training-vertex-ai`
+- Select the project `mobilenetv2_kaggle`
 - You will view the training metrics tracked and automatically updated
+
+### Convert Trained Models to TensorFlow.js
+- Run the conversion script after a Vertex AI job exports a `.keras` model:
+  ```sh
+  sh convert_model_to_tfjs.sh gs://kaggle_nabirds_data/models/<run-id>/<model-name>.keras 2>&1 | tee convert_tfjs_run.log
+  ```
+- Artifacts produced:
+  - `assets/models/birds/` updated locally with `model.json`, `group*-shard*.bin`, and `labels.json`
+  - `gs://kaggle_nabirds_data/mobile/<run-id>/` populated with the same TensorFlow.js layers model files
+  - `convert_tfjs_run.log` captures stdout and stderr for troubleshooting
+- Override destinations by setting environment variables before running:
+  - `MOBILE_BUCKET_URI` to change the upload bucket
+  - `LOCAL_ASSETS_DIR` to change the local sync directory
 
 ### OPTIONAL: Multi GPU Training
 - Open & Review `model-training` > `cli-multi-gpu.sh`
