@@ -9,4 +9,8 @@ dependencies = [
     "google-cloud-storage",
     "requests",
     "python-json-logger==2.0.7",
+    "tensorflowjs",
+    "tensorflow==2.17.0",
+    "keras==3.5.0",
+    "numpy<2",
 ]

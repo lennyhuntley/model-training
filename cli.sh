@@ -16,9 +16,8 @@ export GCP_REGION="us-central1" # Adjust region based on you approved quotas for
 # Change the number of epochs
 # Set the command-line arguments for the new fine-tuning script.
 # Ensure WANDB_KEY is set in your environment: export WANDB_KEY='your_key_here'
-export GCS_BUCKET_NAME="know-now-app-training-data-lh"
-export GCS_DATA_DIR="gs://$GCS_BUCKET_NAME/data/nabirds"
-export CMDARGS="--gcs_data_dir=$GCS_DATA_DIR,--percent_to_use=0.25,--epochs_warmup=2,--epochs_finetune=4,--batch_size=32,--lr_warmup=1e-3,--lr_fine=3e-4,--wandb_key=$WANDB_KEY"
+export GCS_DATA_DIR="gs://kaggle_nabirds_data/nabirds_preprocessed"
+export CMDARGS="--gcs_data_dir=$GCS_DATA_DIR,--percent_to_use=1.0,--epochs_warmup=2,--epochs_finetune=10,--batch_size=64,--lr_warmup=1e-3,--lr_fine=3e-5,--wandb_key=$WANDB_KEY"
 # Run training with GPU
 gcloud ai custom-jobs create \
   --project=$GCP_PROJECT \

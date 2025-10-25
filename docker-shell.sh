@@ -7,17 +7,14 @@ export BASE_DIR=$(pwd)
 export SECRETS_DIR=$(pwd)/../secrets/
 export GCS_BUCKET_URI="gs://know-now-app-trainer-lh"
 export GCP_PROJECT="ac215-475412"
+export DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 
 
 # Build the image based on the Dockerfile
-#docker build -t $IMAGE_NAME -f Dockerfile .
-#docker build -t $IMAGE_NAME --platform=linux/amd64 -f Dockerfile .
-
-#Mac OSX
-docker build -t $IMAGE_NAME --platform=linux/arm64/v8 -f Dockerfile .
+docker build -t $IMAGE_NAME --platform=$DOCKER_PLATFORM -f Dockerfile .
 
 # Run Container
-docker run --rm --name $IMAGE_NAME -ti \
+docker run --rm --platform=$DOCKER_PLATFORM --name $IMAGE_NAME -ti \
 -v "$BASE_DIR":/app \
 -v "$SECRETS_DIR":/secrets \
 -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/model-trainer.json \

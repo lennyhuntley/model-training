@@ -8,7 +8,6 @@ import math
 import sys
 import numpy as np
 import shutil
-import json
 
 # Set Keras backend before importing
 os.environ.setdefault("KERAS_BACKEND", "tensorflow")
@@ -20,8 +19,7 @@ from keras import layers, models
 from keras import mixed_precision
 from keras.optimizers import Adam, AdamW
 from keras.optimizers.schedules import CosineDecay
-# Use tf.keras for TopK metric to avoid import issues across environments
-TopKCategoricalAccuracy = tf.keras.metrics.TopKCategoricalAccuracy
+from keras.metrics import TopKCategoricalAccuracy
 
 # --- Library Imports ---
 import deeplake as dl
@@ -34,15 +32,17 @@ from google.cloud import storage
 def get_args():
     parser = argparse.ArgumentParser(description="Vertex AI Fine-tuning for NABirds")
 
-    # --- W&B and GCS ---
+    # --- W&B and GCS --- 
     parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key.")
     parser.add_argument("--gcs_data_dir", type=str, default="gs://kaggle_nabirds_data/nabirds_preprocessed", help="GCS directory containing the NABirds dataset.")
     parser.add_argument("--gcs_bucket", type=str, default="kaggle_nabirds_data", help="GCS bucket for saving the final model.")
 
+    # --- Dataset --- 
+    
     # --- Dataset ---
     parser.add_argument("--percent_to_use", type=float, default=1.0, help="Percentage of the training dataset to use (0.0 to 1.0).")
 
-    # --- Model ---
+    # --- Model --- 
     parser.add_argument("--model_name", type=str, default="mobilenetv2_nabirds_finetuned", help="Base name for the trained model.")
     parser.add_argument("--img_size", type=int, default=224, help="Input image size (height and width).")
 
@@ -87,18 +87,27 @@ else:
 strategy = tf.distribute.MirroredStrategy()
 print("Number of replicas:", strategy.num_replicas_in_sync)
 
+
 devices = tf.config.experimental.get_visible_devices()
 print("Devices:", devices)
 print(tf.config.experimental.list_logical_devices("GPU"))
 
+
+
 # --- Data Pipeline ---
 print("\n--- Data Pipeline Setup ---")
 
+
+# --- Image Dataset Functions ---
+
 def load_image_and_label(image_path, label, bbox, img_size):
     """Loads an image from a path and prepares the label."""
+    # Load the image from GCS
     image = tf.io.read_file(image_path)
+    # Decode the image to a dense tensor
     image = tf.io.decode_jpeg(image, channels=3)
-
+    shape = tf.shape(image)
+    
     # Bbox is [x, y, width, height] in absolute pixel values.
     # tf.image.crop_to_bounding_box wants [offset_height, offset_width, target_height, target_width].
     offset_y = tf.cast(bbox[1], tf.int32)
@@ -106,43 +115,23 @@ def load_image_and_label(image_path, label, bbox, img_size):
     target_height = tf.cast(bbox[3], tf.int32)
     target_width = tf.cast(bbox[2], tf.int32)
 
+    # Crop the image
     image = tf.image.crop_to_bounding_box(image, offset_y, offset_x, target_height, target_width)
+    
+    # Resize the cropped image
     image = tf.image.resize(image, [img_size, img_size], antialias=True)
     return image, label
 
-# Path to preprocessed dir (GCS or local)
-gcs_preprocessed_dir = args.gcs_data_dir
-
-# Build global class-id to contiguous index mapping once
-ann_path = os.path.join(gcs_preprocessed_dir, "annotations_all.csv")
-with tf.io.gfile.GFile(ann_path, "r") as f:
-    _rows = f.read().strip().split("\n")
-if len(_rows) == 0:
-    raise RuntimeError("annotations_all.csv appears empty")
-header, data_rows = _rows[0], _rows[1:]
-_all_raw_ids = sorted({int(r.split(",")[1]) for r in data_rows})
-raw_to_idx = {raw: i for i, raw in enumerate(_all_raw_ids)}
-NUM_CLASSES = len(_all_raw_ids)
-
-# NEW: explicit remap confirmations
-print(f"Global classes discovered: {NUM_CLASSES}; min_raw={_all_raw_ids[0]}; max_raw={_all_raw_ids[-1]}")
-print("Label remap: using contiguous indices [0..{0}) from {1} raw ids".format(NUM_CLASSES, len(_all_raw_ids)))
-example_raw = _all_raw_ids[:5]
-print("Label remap examples (raw -> idx): " + ", ".join([f"{r}->{raw_to_idx[r]}" for r in example_raw]))
-
-# Optional: save the mapping for reproducibility
-try:
-    with tf.io.gfile.GFile(os.path.join(gcs_preprocessed_dir, "class_map.json"), "w") as f:
-        json.dump({"raw_to_idx": raw_to_idx, "num_classes": NUM_CLASSES}, f)
-except Exception as _e:
-    print("Note: could not write class_map.json (non-fatal):", _e)
-
-def create_dataset_from_gcs(gcs_dir, img_size, training, batch_size, raw_to_idx, num_classes, percent_to_use=1.0):
-    """Creates a tf.data.Dataset from image folders in GCS/local with fixed label mapping."""
+def create_dataset_from_gcs(gcs_dir, img_size, training, batch_size, percent_to_use=1.0):
+    """Creates a tf.data.Dataset from image folders in GCS."""
+    """Creates a tf.data.Dataset from image folders in GCS."""
+    # Read the annotations CSV from GCS
     annotations_path = os.path.join(gcs_dir, 'annotations_all.csv')
     split_path = os.path.join(gcs_dir, 'train_test_split.txt')
 
+    # Use tf.io.gfile to read files from GCS
     with tf.io.gfile.GFile(annotations_path, 'r') as f:
+        # Skip header
         annotations = f.read().strip().split('\n')[1:]
     with tf.io.gfile.GFile(split_path, 'r') as f:
         splits = f.read().strip().split('\n')
@@ -151,113 +140,109 @@ def create_dataset_from_gcs(gcs_dir, img_size, training, batch_size, raw_to_idx,
     labels = []
     bboxes = []
 
-    # NABirds: second column is 1 for training, 0 for test
+    # Create a mapping from image_id to split (0 for train, 1 for test)
     split_map = {line.split(' ')[0]: int(line.split(' ')[1]) for line in splits}
 
     for line in annotations:
         parts = line.split(',')
         image_id = parts[0]
-        raw_class_id = int(parts[1])  # raw label from file
+        class_id = int(parts[1])
         image_name = parts[2]
-        bbox = [float(p) for p in parts[3:]]  # [x, y, w, h]
 
-        is_training_image = split_map.get(image_id, -1)  # 1=train, 0=test
+        # Determine if the image is in the desired split (train/test)
+        is_test_image = split_map.get(image_id, -1)
 
-        if (training and is_training_image == 1) or (not training and is_training_image == 0):
+        if (training and is_test_image == 0) or (not training and is_test_image == 1):
+            # Construct the full GCS path to the image
             full_path = os.path.join(gcs_dir, 'images', image_name)
             image_paths.append(full_path)
-            labels.append(raw_to_idx[raw_class_id])  # remap to contiguous index
+            labels.append(class_id)
+            # Extract bbox [x, y, width, height]
+            bbox = [float(p) for p in parts[3:]]
             bboxes.append(bbox)
 
-    # Optional stratified sampling on the remapped labels
+    # If using a subset for training, perform stratified sampling.
     if training and percent_to_use < 1.0:
         print(f"Performing stratified sampling to use {percent_to_use * 100:.0f}% of the training data.")
+        # Group paths by label
         paths_by_label = {}
-        for path, lab, bb in zip(image_paths, labels, bboxes):
-            paths_by_label.setdefault(lab, []).append((path, bb))
+        for path, label, bbox in zip(image_paths, labels, bboxes):
+            if label not in paths_by_label:
+                paths_by_label[label] = []
+            paths_by_label[label].append((path, bbox))
 
-        stratified_paths, stratified_labels, stratified_bboxes = [], [], []
-        for lab, items in paths_by_label.items():
-            np.random.shuffle(items)
-            num_to_take = max(1, int(len(items) * percent_to_use))
+        # Sample from each group
+        stratified_paths = []
+        stratified_labels = []
+        stratified_bboxes = []
+        for label, path_bbox_pairs in paths_by_label.items():
+            np.random.shuffle(path_bbox_pairs)
+            num_to_take = max(1, int(len(path_bbox_pairs) * percent_to_use))
             for i in range(num_to_take):
-                p, bb = items[i]
-                stratified_paths.append(p)
-                stratified_labels.append(lab)
-                stratified_bboxes.append(bb)
+                path, bbox = path_bbox_pairs[i]
+                stratified_paths.append(path)
+                stratified_labels.append(label)
+                stratified_bboxes.append(bbox)
+        
+        image_paths = stratified_paths
+        labels = stratified_labels
+        bboxes = stratified_bboxes
 
-        tmp = list(zip(stratified_paths, stratified_labels, stratified_bboxes))
-        np.random.shuffle(tmp)
-        image_paths, labels, bboxes = zip(*tmp)
-        image_paths, labels, bboxes = list(image_paths), list(labels), list(bboxes)
+        # Final shuffle of the stratified subset
+        temp_dataset = list(zip(image_paths, labels, bboxes))
+        np.random.shuffle(temp_dataset)
+        image_paths, labels, bboxes = zip(*temp_dataset)
         print(f"Using {len(image_paths)} training samples after stratification.")
 
-    # Per-split label stats (after remap)
-    if labels:
-        unique_lbls = sorted(set(int(x) for x in labels))
-        print(("Split=train" if training else "Split=val") +
-              f" unique labels: {len(unique_lbls)}, min_idx={unique_lbls[0]}, max_idx={unique_lbls[-1]}")
-        bad_low  = [y for y in unique_lbls if y < 0]
-        bad_high = [y for y in unique_lbls if y >= num_classes]
-        if bad_low or bad_high:
-            print(f"WARNING: Found labels out of range 0..{num_classes-1}: low={bad_low[:5]} high={bad_high[:5]}")
+    # Convert to TensorFlow constants for robust dataset creation
+    image_paths_tf = tf.constant(image_paths, dtype=tf.string)
+    labels_tf = tf.constant(labels, dtype=tf.int32)
+    bboxes_tf = tf.constant(bboxes, dtype=tf.float32)
 
-    # Convert to TensorFlow constants
-    image_paths_tf = tf.constant(list(image_paths), dtype=tf.string)
-    labels_tf = tf.constant(list(labels), dtype=tf.int32)
-    bboxes_tf = tf.constant(list(bboxes), dtype=tf.float32)
-
+    # Create a dataset from the final paths, labels, and bounding boxes
     dataset = tf.data.Dataset.from_tensor_slices((image_paths_tf, labels_tf, bboxes_tf))
-    if training:
-        dataset = dataset.shuffle(10000)
 
+    if training:
+        dataset = dataset.shuffle(10000) # Shuffle records
+
+    # Map the loading function
+    # Determine number of classes from the labels
+    num_classes = len(set(labels))
+    print(f"Found {num_classes} classes.")
+
+    # Map the loading and one-hot encoding function
     def process_path(path, lbl, bbox):
-        tf.debugging.assert_greater_equal(lbl, 0)
-        tf.debugging.assert_less(lbl, num_classes)
-        img, lbl_out = load_image_and_label(path, lbl, bbox, img_size)
-        y = tf.one_hot(lbl_out, num_classes, dtype=tf.float32)
-        return img, y
+        img, lbl = load_image_and_label(path, lbl, bbox, img_size)
+        return img, tf.one_hot(lbl, num_classes, dtype=tf.float32)
 
     dataset = dataset.map(process_path, num_parallel_calls=tf.data.AUTOTUNE)
+
+
     dataset = dataset.batch(batch_size, drop_remainder=training)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    return dataset, len(image_paths)
+    return dataset, len(image_paths), num_classes
 
-# Build datasets using the global mapping and fixed NUM_CLASSES
-train_ds, NUM_TRAIN_SAMPLES = create_dataset_from_gcs(
+# Create datasets from GCS image folders
+
+# The GCS directory should point to the 'nabirds_preprocessed' folder
+gcs_preprocessed_dir = args.gcs_data_dir
+
+train_ds, NUM_TRAIN_SAMPLES, NUM_CLASSES = create_dataset_from_gcs(
     gcs_preprocessed_dir,
     args.img_size,
     training=True,
     batch_size=args.batch_size,
-    raw_to_idx=raw_to_idx,
-    num_classes=NUM_CLASSES,
     percent_to_use=args.percent_to_use
 )
 
-val_ds, NUM_VAL_SAMPLES = create_dataset_from_gcs(
+val_ds, NUM_VAL_SAMPLES, _ = create_dataset_from_gcs(
     gcs_preprocessed_dir,
     args.img_size,
     training=False,
-    batch_size=args.batch_size,
-    raw_to_idx=raw_to_idx,
-    num_classes=NUM_CLASSES
+    batch_size=args.batch_size
 )
 
 print("Data pipelines ready.")
-print(f"Train samples: {NUM_TRAIN_SAMPLES} | Val samples: {NUM_VAL_SAMPLES} | NUM_CLASSES: {NUM_CLASSES}")
-
-# NEW: one-batch sanity check to confirm one-hot depth and remap worked
-try:
-    imgs, ys = next(iter(train_ds.take(1)))
-    min_idx = int(tf.reduce_min(tf.argmax(ys, -1)))
-    max_idx = int(tf.reduce_max(tf.argmax(ys, -1)))
-    print("Batch check:",
-          "imgs", tuple(imgs.shape),
-          "ys", tuple(ys.shape),
-          "one_hot_depth", ys.shape[-1],
-          "argmax[min,max] =", (min_idx, max_idx))
-except Exception as _e:
-    print("Batch check skipped due to error (non-fatal):", repr(_e))
 
 # --- Model Building ---
 print("\n--- Model Definition ---")
@@ -275,7 +260,7 @@ def make_augmenter(img_size):
 def build_model(num_classes, img_size):
     """Builds the MobileNetV2 model for fine-tuning."""
     inputs = layers.Input(shape=(img_size, img_size, 3), dtype="uint8")
-
+    
     # Cast to float32 for augmentation and preprocessing within a Keras layer
     x = layers.Lambda(lambda t: tf.cast(t, "float32"))(inputs)
 
@@ -285,6 +270,7 @@ def build_model(num_classes, img_size):
     # Pre-processing for MobileNetV2
     x = keras.applications.mobilenet_v2.preprocess_input(x)
 
+    
     # Backbone
     backbone = keras.applications.MobileNetV2(
         include_top=False,
@@ -294,10 +280,10 @@ def build_model(num_classes, img_size):
     backbone.trainable = False  # Start with a frozen backbone
 
     # Pass the backbone's output to the classification head
-    x = backbone(x)
+    x = backbone(x) # Let the fine-tuning fit call control the training mode
     x = layers.GlobalAveragePooling2D(name="gap")(x)
     x = layers.Dropout(0.4, name="dropout")(x)
-
+    
     # Use float32 for the final layer for numerical stability
     logits = layers.Dense(num_classes, dtype="float32", name="logits")(x)
     probs = layers.Activation("softmax", dtype="float32", name="probs")(logits)
@@ -307,7 +293,7 @@ def build_model(num_classes, img_size):
     return model
 
 def unfreeze_top(model: keras.Model, ratio: float, freeze_bn: bool = True):
-    """Unfreezes the top ratio of layers in the model's backbone."""
+    """Unfreezes the top `ratio` of layers in the model's backbone."""
     backbone = getattr(model, "_backbone", None)
     if backbone is None:
         print("WARNING: Model has no '_backbone' attribute to unfreeze.")
@@ -315,7 +301,7 @@ def unfreeze_top(model: keras.Model, ratio: float, freeze_bn: bool = True):
 
     n_layers = len(backbone.layers)
     n_to_unfreeze = int(n_layers * (1 - ratio))
-
+    
     print(f"Unfreezing top {n_to_unfreeze} / {n_layers} layers of the backbone.")
 
     for i, layer in enumerate(reversed(backbone.layers)):
@@ -323,17 +309,18 @@ def unfreeze_top(model: keras.Model, ratio: float, freeze_bn: bool = True):
             layer.trainable = True
         else:
             layer.trainable = False
-
+        
         # Optionally keep BatchNormalization layers frozen
         if freeze_bn and isinstance(layer, layers.BatchNormalization):
             layer.trainable = False
 
 print("Model building functions defined.")
 
-# --- Callbacks ---
+
+# --- Custom Callback for Two-Phase Training ---
 
 class FinetuningCallback(keras.callbacks.Callback):
-    """Handles the transition from warmup to fine-tuning."""
+    """Callback to handle the transition from warmup to fine-tuning."""
     def __init__(self, warmup_epochs, finetune_lr_schedule, finetune_wd, freeze_ratio):
         super().__init__()
         self.warmup_epochs = warmup_epochs
@@ -342,34 +329,18 @@ class FinetuningCallback(keras.callbacks.Callback):
         self.freeze_ratio = freeze_ratio
 
     def on_epoch_begin(self, epoch, logs=None):
-        # Start of fine-tuning phase
+        # Check if it's the first epoch of the fine-tuning phase
         if epoch == self.warmup_epochs:
             print("\n--- Starting Fine-tuning Phase ---")
+            # Unfreeze the top layers of the backbone
             unfreeze_top(self.model, ratio=self.freeze_ratio, freeze_bn=True)
-            # swap to schedule
+            
+            # Update the learning rate of the existing optimizer
             self.model.optimizer.learning_rate = self.finetune_lr_schedule
-            print("Model layers unfrozen. Learning rate updated to schedule.")
+            print(f"Model layers unfrozen. Learning rate updated.")
 
-class LogLearningRate(keras.callbacks.Callback):
-    """Logs the current learning rate to Weights & Biases."""
-    def _current_lr_tensor(self):
-        lr = self.model.optimizer.learning_rate
-        # If it's a schedule or otherwise callable, evaluate at current iteration
-        if callable(lr):
-            return lr(self.model.optimizer.iterations)
-        return tf.convert_to_tensor(lr, dtype=tf.float32)
 
-    def on_train_batch_end(self, batch, logs=None):
-        lr_t = self._current_lr_tensor()
-        lr_val = float(tf.keras.backend.get_value(lr_t))
-        wandb.log({"learning_rate": lr_val}, commit=False)
-
-    def on_epoch_end(self, epoch, logs=None):
-        lr_t = self._current_lr_tensor()
-        lr_val = float(tf.keras.backend.get_value(lr_t))
-        wandb.log({"epoch_learning_rate": lr_val})
-
-# --- Training ---
+# --- Training --- 
 print("\n--- Training Initializing ---")
 
 # W&B Login
@@ -379,6 +350,7 @@ if not wdb_key:
 wdb_project = "mobilenetv2_kaggle"
 wdb_run_name = f"{args.model_name}-{int(time.time())}"
 wdb_config = vars(args)
+
 wdb_config["num_classes"] = NUM_CLASSES
 
 wandb.login(key=wdb_key)
@@ -389,18 +361,22 @@ with strategy.scope():
     model = build_model(NUM_CLASSES, args.img_size)
     print(model.summary())
 
-    # Compile
+    # --- Unified Training Loop ---
+    print("\n--- Unified Training Loop ---")
+    
+    # Initial compilation with the AdamW optimizer for the entire run
     model.compile(
         optimizer=AdamW(learning_rate=args.lr_warmup, weight_decay=args.weight_decay),
         loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
-        metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5")]
+        metrics=["accuracy"]
     )
 
-    # Steps and schedule
-    steps_per_epoch = max(1, NUM_TRAIN_SAMPLES // args.batch_size)
+    # Prepare variables for the callback
+    steps_per_epoch = NUM_TRAIN_SAMPLES // args.batch_size
     validation_steps = int(math.ceil(NUM_VAL_SAMPLES / args.batch_size))
     total_epochs = args.epochs_warmup + args.epochs_finetune
 
+    # Create the learning rate scheduler for the fine-tuning phase
     decay_steps = steps_per_epoch * args.epochs_finetune
     lr_schedule = CosineDecay(
         initial_learning_rate=args.lr_fine,
@@ -408,13 +384,12 @@ with strategy.scope():
         alpha=0.1
     )
 
-    # Callbacks
+    # All callbacks for the entire run
     all_callbacks = [
         WandbMetricsLogger(),
-        LogLearningRate(),  # logs LR and prevents W&B LR error
         FinetuningCallback(
-            warmup_epochs=args.epochs_warmup,
-            finetune_lr_schedule=lr_schedule,
+            warmup_epochs=args.epochs_warmup, 
+            finetune_lr_schedule=lr_schedule, 
             finetune_wd=args.weight_decay,
             freeze_ratio=args.freeze_ratio
         ),
@@ -425,15 +400,15 @@ with strategy.scope():
             save_best_only=True
         ),
         keras.callbacks.EarlyStopping(
-            monitor="val_accuracy",
-            mode="max",
-            patience=5,
-            restore_best_weights=True,
+            monitor="val_accuracy", 
+            mode="max", 
+            patience=5,  # Increased patience
+            restore_best_weights=True, 
             verbose=1
         )
     ]
 
-    # Fit
+    # Single, unified model.fit call
     model.fit(
         train_ds.repeat(),
         validation_data=val_ds,
@@ -444,21 +419,24 @@ with strategy.scope():
         verbose=2
     )
 
-    # Final evaluation and saving
+    # --- Evaluation and Saving (inside strategy scope) ---
     print("\n--- Final Evaluation ---")
+    # Re-compile the model to ensure metrics are correctly initialized for evaluation
     model.compile(
         loss=keras.losses.CategoricalCrossentropy(label_smoothing=args.label_smoothing),
-        metrics=["accuracy", TopKCategoricalAccuracy(k=5, name="top5")]
+        metrics=["accuracy"]
     )
     eval_out = model.evaluate(val_ds, steps=validation_steps, verbose=1, return_dict=True)
     print("Final eval metrics:", eval_out)
     wdb.log({"final_eval_" + k: v for k, v in eval_out.items()})
 
+    # Save the final model to a .keras file
     model_filename = f"{args.model_name}.keras"
     model.save(model_filename)
     print(f"Model saved locally to {model_filename}")
 
-    print("\n--- Uploading to GCS ---")
+    # Upload to GCS
+    print(f"\n--- Uploading to GCS ---")
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(args.gcs_bucket)
@@ -469,7 +447,7 @@ with strategy.scope():
     except Exception as e:
         print(f"ERROR: Failed to upload model to GCS: {e}")
 
-# Finish W&B run
+# Finish W&B run (outside scope)
 wdb.finish()
 
 print("\n--- Training Job Complete ---")
